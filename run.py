@@ -93,6 +93,10 @@ if sys.platform.startswith("linux"):
 from modules import platform_info
 platform_info.print_banner()
 
+# Import insightface before PySide6 (via modules.ui). PySide6/shiboken's
+# import hook breaks six.moves used by insightface -> matplotlib -> dateutil.
+import insightface  # noqa: F401
+
 from modules import core
 
 if __name__ == '__main__':

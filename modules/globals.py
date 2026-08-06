@@ -65,6 +65,10 @@ mask_down_size: float = 0.1        # Expansion factor for lower lip mask (relati
 mask_size: float = 1.0             # Expansion factor for upper lip mask (relative)
 mouth_mask_size: float = 0.0       # Mouth mask size (0-100; 0=off, 100=mouth to chin)
 
+# Restrict paste to the jaw/cheek landmark hull so ears (and headsets over
+# them) keep the original pixels instead of swapped ear texture.
+exclude_ears: bool = False
+
 # --- START: Added for Frame Interpolation ---
 enable_interpolation: bool = True # Toggle temporal smoothing
 interpolation_weight: float = 0  # Blend weight for current frame (0.0-1.0). Lower=smoother.

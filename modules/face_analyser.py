@@ -90,10 +90,12 @@ def _optimize_det_model(fa: Any, providers) -> None:
 def _needs_landmark() -> bool:
     """Check whether any active feature requires 106-point landmarks.
 
-    Landmarks are needed by face enhancers and mouth masking, but not
-    by the face swapper alone.
+    Landmarks are needed by face enhancers, mouth masking, and exclude-ears
+    paste masking — not by the face swapper alone.
     """
     if getattr(modules.globals, "mouth_mask", False):
+        return True
+    if getattr(modules.globals, "exclude_ears", False):
         return True
     processors = getattr(modules.globals, "frame_processors", [])
     return any(p in processors for p in
@@ -191,8 +193,9 @@ def ensure_landmarks(frame: Frame, faces: Any) -> None:
 
     The fast webcam path (detect_one_face_fast / detect_many_faces_fast)
     produces detection-only Face objects with no ``landmark_2d_106``.
-    Mouth masking needs those landmarks, so add them on demand only when
-    the feature is active — keeping the fast path fast otherwise.
+    Mouth masking and exclude-ears paste masking need those landmarks, so
+    add them on demand only when the feature is active — keeping the fast
+    path fast otherwise.
     """
     if faces is None:
         return

@@ -99,6 +99,12 @@ def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
                     roi_aff[0, 2] -= px1
                     roi_aff[1, 2] -= py1
                     fm = _create_elliptical_mask((fh, fw))
+                    if getattr(modules.globals, "exclude_ears", False):
+                        landmarks = getattr(target_face, "landmark_2d_106", None)
+                        hull = _face_outline_alpha(landmarks, affine_matrix, fh)
+                        if hull is not None:
+                            # hull is uint8 [0,255]; fm is float32 [0,1]
+                            fm = np.minimum(fm, hull.astype(np.float32) * (1.0 / 255.0))
                     mroi = cv2.warpAffine(fm, roi_aff, (rw, rh),
                                           flags=cv2.INTER_LINEAR,
                                           borderMode=cv2.BORDER_CONSTANT, borderValue=0)
@@ -334,6 +340,63 @@ def _get_soft_alpha(size: int) -> np.ndarray:
         _paste_cache['alpha_size'] = size
     return _paste_cache['soft_alpha']
 
+
+def _face_outline_alpha(landmarks: np.ndarray, M: np.ndarray, size: int) -> Optional[np.ndarray]:
+    """Soft alpha from the jaw/cheek outline in aligned-face space.
+
+    InsightFace 2d106 points 0–32 follow the face contour and sit inside the
+    ears, so intersecting the paste ellipse with this hull keeps original
+    pixels on headsets / ears. A modest forehead extension covers the
+    hairline without reaching the ear cups.
+    """
+    if landmarks is None or not isinstance(landmarks, np.ndarray) or landmarks.shape[0] < 33:
+        return None
+    outline = landmarks[0:33].astype(np.float32)
+    if not np.all(np.isfinite(outline)):
+        return None
+
+    # Optional forehead coverage (same idea as create_face_mask, lighter).
+    if landmarks.shape[0] >= 43:
+        eyebrows = landmarks[33:43].astype(np.float32)
+        if np.all(np.isfinite(eyebrows)):
+            chin = outline[16]
+            eyebrow_center = np.mean(eyebrows, axis=0)
+            up_vector = eyebrow_center - chin
+            norm = np.linalg.norm(up_vector)
+            if norm > 0:
+                up_vector = up_vector / norm
+                forehead = eyebrows + up_vector * (norm * 0.7)
+                top_center = np.mean(forehead, axis=0)
+                forehead = (forehead - top_center) * 1.1 + top_center
+                outline = np.concatenate((outline, forehead), axis=0)
+
+    # Warp outline into the 128×128 aligned crop using the swap affine M.
+    aligned = (M[:, :2] @ outline.T).T + M[:, 2]
+    try:
+        hull = cv2.convexHull(aligned.astype(np.float32))
+    except Exception:
+        return None
+    if hull is None or len(hull) < 3:
+        return None
+
+    mask = np.zeros((size, size), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, np.round(hull).astype(np.int32), 255)
+    # Soft edge so the hull boundary doesn't hard-cut the cheek.
+    mask = cv2.GaussianBlur(mask, (15, 15), 5)
+    return mask
+
+
+def _paste_alpha_for_face(size: int, M: np.ndarray, face: Optional[Face]) -> np.ndarray:
+    """Elliptical soft alpha, optionally clipped to the face-outline hull."""
+    soft_alpha = _get_soft_alpha(size)
+    if not getattr(modules.globals, "exclude_ears", False) or face is None:
+        return soft_alpha
+    landmarks = getattr(face, "landmark_2d_106", None)
+    hull_alpha = _face_outline_alpha(landmarks, M, size)
+    if hull_alpha is None:
+        return soft_alpha
+    return cv2.min(soft_alpha, hull_alpha)
+
 # CUDA graph swap session cache
 _cuda_graph_session = {
     'session': None,
@@ -439,13 +502,23 @@ def _cuda_graph_swap_inference(blob: np.ndarray, latent: np.ndarray) -> np.ndarr
         return cg['io_binding'].get_outputs()[0].numpy()
 
 
-def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, M: np.ndarray) -> Frame:
+def _fast_paste_back(
+    target_img: Frame,
+    bgr_fake: np.ndarray,
+    aimg: np.ndarray,
+    M: np.ndarray,
+    face: Optional[Face] = None,
+) -> Frame:
     """Paste bgr_fake back onto target_img via the inverse affine of M.
 
     Restricts work to the face bbox in output coordinates and warps a
     precomputed feathered alpha template per-frame instead of running a
     size-scaled erode+blur on the warped mask. Cost is O(crop_area) regardless
     of how much of the frame the face occupies.
+
+    When ``exclude_ears`` is enabled and ``face`` has 2d106 landmarks, the
+    paste alpha is intersected with the jaw/cheek outline so ear/headset
+    pixels stay original.
     """
     h, w = target_img.shape[:2]
     face_h, face_w = aimg.shape[:2]
@@ -477,7 +550,7 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
     IM_crop[1, 2] -= y1p
     crop_w, crop_h = x2p - x1p, y2p - y1p
 
-    soft_alpha = _get_soft_alpha(face_h)
+    soft_alpha = _paste_alpha_for_face(face_h, M, face)
     bgr_fake_crop = cv2.warpAffine(bgr_fake, IM_crop, (crop_w, crop_h), borderMode=cv2.BORDER_REPLICATE)
     alpha_crop = cv2.warpAffine(soft_alpha, IM_crop, (crop_w, crop_h), borderValue=0)
 
@@ -521,11 +594,17 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     opacity = max(0.0, min(1.0, opacity))
     mouth_mask_enabled = getattr(modules.globals, "mouth_mask", False)
     poisson_blend_enabled = getattr(modules.globals, "poisson_blend", False)
+    exclude_ears_enabled = getattr(modules.globals, "exclude_ears", False)
     # Poisson blend's seamlessClone needs the genuine pre-swap frame as its
     # destination. Without this, original_frame aliases temp_frame, which
     # _fast_paste_back mutates in place — so seamlessClone would blend the
     # swapped face onto the already-swapped frame (no visible effect).
-    needs_original = opacity < 1.0 or mouth_mask_enabled or poisson_blend_enabled
+    needs_original = (
+        opacity < 1.0
+        or mouth_mask_enabled
+        or poisson_blend_enabled
+        or exclude_ears_enabled
+    )
     if needs_original:
         original_frame = temp_frame.copy()
     else:
@@ -560,7 +639,9 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         _face_size = face_swapper.input_size[0]
         _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
 
-        swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M)
+        swapped_frame = _fast_paste_back(
+            temp_frame, bgr_fake, _aimg_dummy, M, face=target_face
+        )
 
     except Exception as e:
         print(f"Error during face swap: {e}")
@@ -1101,6 +1182,26 @@ def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
 # MASKING FUNCTIONS (Mostly unchanged, added safety checks and minor improvements)
 # ==========================
 
+def _ellipse_polygon(
+    center: np.ndarray,
+    axes: Tuple[float, float],
+    angle_deg: float,
+    n: int = 48,
+) -> np.ndarray:
+    """Sample a closed ellipse as an Nx2 float polygon (not closed-duplicated)."""
+    cx, cy = float(center[0]), float(center[1])
+    ax, ay = max(1.0, float(axes[0])), max(1.0, float(axes[1]))
+    rad = np.deg2rad(angle_deg)
+    cos_a, sin_a = np.cos(rad), np.sin(rad)
+    t = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False, dtype=np.float32)
+    x = ax * np.cos(t)
+    y = ay * np.sin(t)
+    # Rotate then translate into image space.
+    xr = x * cos_a - y * sin_a + cx
+    yr = x * sin_a + y * cos_a + cy
+    return np.stack((xr, yr), axis=1)
+
+
 def create_lower_mouth_mask(
     face: Face, frame: Frame
 ) -> (np.ndarray, np.ndarray, tuple, np.ndarray):
@@ -1122,15 +1223,9 @@ def create_lower_mouth_mask(
         return mask, mouth_cutout, mouth_box, lower_lip_polygon
 
     try: # Wrap main logic in try-except
-        # Outer mouth/lip landmarks (52-63) — the lip outline only. In this
-        # repo's insightface 2d106 convention these 12 points, taken in index
-        # order, form a SIMPLE (non-self-intersecting) closed polygon that
-        # cv2.fillPoly fills as one solid region directly over the mouth.
-        # This is the last shipped, known-good landmark set; range(52,72)
-        # (the regression) added the inner-lip points and made the path
-        # self-intersect, and the ancient [65,66,62,...,0,8,7...] indices
-        # belong to a different/older landmark convention (they land on the
-        # inner lip + random jaw points, so the mask never covers the mouth).
+        # Outer mouth/lip landmarks (52-63). Connecting them in raw index order
+        # yields a jagged self-crossing outline; we only use the point cloud to
+        # fit a smooth ellipse so the mask stays round-shaped.
         lower_lip_order = list(range(52, 64))
 
         # All indices must be valid for the loaded landmark set
@@ -1151,34 +1246,52 @@ def create_lower_mouth_mask(
             return mask, mouth_cutout, mouth_box, lower_lip_polygon
 
         # Drive expansion from the Mouth Mask slider so it actually responds.
-        # The known-good version expanded by the now-unused mask_down_size
-        # constant, which is why the slider had no effect.
         # s: 0.0 (slider ~0, tight lip outline) -> 1.0 (slider 100, mouth->chin).
         mouth_mask_size = getattr(modules.globals, "mouth_mask_size", 0.0) # 0-100 slider
         s = max(0.0, min(1.0, mouth_mask_size / 100.0))
 
-        # Uniformly scaling a simple polygon about its centroid keeps it simple
-        # (no self-intersection). x grows with expansion_factor; points below
-        # centre (toward the chin) also get an extra downward stretch so high
-        # slider values reach from the mouth down to the chin.
+        # Base mouth half-sizes from the landmark cloud.
+        half_w = max(4.0, 0.5 * (np.max(lower_lip_landmarks[:, 0]) - np.min(lower_lip_landmarks[:, 0])))
+        half_h = max(3.0, 0.5 * (np.max(lower_lip_landmarks[:, 1]) - np.min(lower_lip_landmarks[:, 1])))
+
+        # Grow into a rounder oval; add downward stretch/shift toward the chin
+        # at higher slider values (same intent as the old per-point chin_bias).
         expansion_factor = 1.0 + s * 2.0          # 1.0x -> 3.0x
-        chin_bias = 1.0 + s * 2.0                  # extra downward stretch
-        offsets = lower_lip_landmarks - center
-        scale_y = np.where(offsets[:, 1] > 0,
-                           expansion_factor * chin_bias, expansion_factor)
-        expanded_landmarks = lower_lip_landmarks.copy()
-        expanded_landmarks[:, 0] = center[0] + offsets[:, 0] * expansion_factor
-        expanded_landmarks[:, 1] = center[1] + offsets[:, 1] * scale_y
+        axes_x = half_w * expansion_factor * 1.15  # slight widen so it reads oval, not flat
+        axes_y = half_h * expansion_factor * (1.0 + s * 1.5)
+        ellipse_center = center.copy()
+        ellipse_center[1] += half_h * s * 1.2     # bias coverage toward chin
+
+        # Prefer pose-aware ellipse from the landmark cloud when possible.
+        angle_deg = 0.0
+        try:
+            (fit_c, fit_axes, fit_angle) = cv2.fitEllipse(
+                lower_lip_landmarks.astype(np.float32)
+            )
+            # fitEllipse returns full axis lengths; convert to half-axes and scale.
+            angle_deg = float(fit_angle)
+            axes_x = max(1.0, 0.5 * float(fit_axes[0]) * expansion_factor * 1.15)
+            axes_y = max(
+                1.0, 0.5 * float(fit_axes[1]) * expansion_factor * (1.0 + s * 1.5)
+            )
+            ellipse_center = np.array(fit_c, dtype=np.float32)
+            ellipse_center[1] += half_h * s * 1.2
+        except (cv2.error, ValueError, TypeError):
+            pass
+
+        expanded_landmarks = _ellipse_polygon(
+            ellipse_center, (axes_x, axes_y), angle_deg, n=48
+        )
 
         # Ensure landmarks are finite after adjustments
         if not np.all(np.isfinite(expanded_landmarks)):
             # print("Warning: Non-finite values detected after expanding landmarks.")
             return mask, mouth_cutout, mouth_box, lower_lip_polygon
 
-        expanded_landmarks = expanded_landmarks.astype(np.int32)
+        expanded_landmarks_i = np.round(expanded_landmarks).astype(np.int32)
 
-        min_x, min_y = np.min(expanded_landmarks, axis=0)
-        max_x, max_y = np.max(expanded_landmarks, axis=0)
+        min_x, min_y = np.min(expanded_landmarks_i, axis=0)
+        max_x, max_y = np.max(expanded_landmarks_i, axis=0)
 
         # Add padding *after* initial min/max calculation
         padding_ratio = 0.1 # Percentage padding
@@ -1199,11 +1312,24 @@ def create_lower_mouth_mask(
             mask_roi_w = max_x - min_x
             mask_roi = np.zeros((mask_roi_h, mask_roi_w), dtype=np.uint8)
 
-            # Shift polygon coordinates relative to the ROI's top-left corner
-            polygon_relative_to_roi = expanded_landmarks - [min_x, min_y]
-
-            # Draw polygon on the ROI mask
-            cv2.fillPoly(mask_roi, [polygon_relative_to_roi], 255)
+            # Draw the round ellipse directly in ROI space (smoother than a
+            # coarse polygon fill at small sizes).
+            roi_center = (
+                int(round(ellipse_center[0] - min_x)),
+                int(round(ellipse_center[1] - min_y)),
+            )
+            roi_axes = (max(1, int(round(axes_x))), max(1, int(round(axes_y))))
+            cv2.ellipse(
+                mask_roi,
+                roi_center,
+                roi_axes,
+                angle_deg,
+                0,
+                360,
+                255,
+                -1,
+                lineType=cv2.LINE_AA,
+            )
 
             # Apply Gaussian blur (GPU-accelerated when available)
             blur_k_size = getattr(modules.globals, "mask_blur_kernel", 15) # Default 15
@@ -1216,7 +1342,7 @@ def create_lower_mouth_mask(
             # Extract the masked area from the *original* frame
             mouth_cutout = frame[min_y:max_y, min_x:max_x].copy()
 
-            lower_lip_polygon = expanded_landmarks # Return polygon in original frame coords
+            lower_lip_polygon = expanded_landmarks_i # Smooth oval in frame coords
             mouth_box = (min_x, min_y, max_x, max_y) # Return the calculated box
         else:
             # print("Warning: Invalid mouth mask bounding box after padding/clamping.") # Optional debug
@@ -1264,13 +1390,20 @@ def draw_mouth_mask_visualization(
     if max_x <= min_x or max_y <= min_y:
         return frame # Invalid box
 
-    # Draw the lower lip polygon (green outline)
+    # Draw the mouth oval (green outline)
     try:
          # Ensure polygon points are within frame boundaries before drawing
          safe_polygon = lower_lip_polygon.copy()
          safe_polygon[:, 0] = np.clip(safe_polygon[:, 0], 0, width - 1)
          safe_polygon[:, 1] = np.clip(safe_polygon[:, 1], 0, height - 1)
-         cv2.polylines(vis_frame, [safe_polygon.astype(np.int32)], isClosed=True, color=(0, 255, 0), thickness=2)
+         cv2.polylines(
+             vis_frame,
+             [safe_polygon.astype(np.int32)],
+             isClosed=True,
+             color=(0, 255, 0),
+             thickness=2,
+             lineType=cv2.LINE_AA,
+         )
     except Exception as e:
         print(f"Error drawing polygon for visualization: {e}") # Optional debug
         pass

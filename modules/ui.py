@@ -314,6 +314,7 @@ def save_switch_states():
         "mouth_mask": modules.globals.mouth_mask,
         "show_mouth_mask_box": modules.globals.show_mouth_mask_box,
         "mouth_mask_size": modules.globals.mouth_mask_size,
+        "exclude_ears": modules.globals.exclude_ears,
     }
     try:
         with open("switch_states.json", "w") as f:
@@ -343,6 +344,7 @@ def load_switch_states():
         modules.globals.mouth_mask_size = 0.0
         modules.globals.mouth_mask = False
         modules.globals.show_mouth_mask_box = False
+        modules.globals.exclude_ears = state.get("exclude_ears", False)
     except FileNotFoundError:
         pass
     except (OSError, json.JSONDecodeError):
@@ -590,6 +592,11 @@ class MainWindow(QMainWindow):
                                   "Swap every detected face, not just the primary one")
         self.sw_poisson = make("poisson_blend", "Poisson Blend",
                                "Blend face edges smoothly using Poisson blending")
+        self.sw_exclude_ears = make(
+            "exclude_ears",
+            "Exclude ears",
+            "Paste only inside the face outline so ears and headsets stay original",
+        )
         self.sw_color_fix = make("color_correction", "Fix Blueish Cam",
                                  "Fix blue/green color cast from some webcams")
         self.sw_show_fps = make("show_fps", "Show FPS",
@@ -605,14 +612,16 @@ class MainWindow(QMainWindow):
             self.sw_keep_fps, self.sw_keep_audio,
             self.sw_keep_frames, self.sw_many_faces,
             self.sw_map_faces, self.sw_show_fps,
-            self.sw_poisson, self.sw_color_fix,
+            self.sw_poisson, self.sw_exclude_ears,
+            self.sw_color_fix,
         ]
         for i, w in enumerate(items):
             grid.addWidget(w, i // 2, i % 2)
 
-        # Face enhancer dropdown
+        # Face enhancer dropdown — place on the next free row after switches
+        next_row = (len(items) + 1) // 2
         enhancer_label = QLabel(_("Face Enhancer:"))
-        grid.addWidget(enhancer_label, len(items) // 2, 0)
+        grid.addWidget(enhancer_label, next_row, 0)
 
         self.cb_enhancer = QComboBox()
         self.cb_enhancer.addItems(["None", "GFPGAN", "GPEN-512", "GPEN-256"])
@@ -626,7 +635,7 @@ class MainWindow(QMainWindow):
         self.cb_enhancer.setCurrentText(initial)
         self.cb_enhancer.currentTextChanged.connect(self._on_enhancer_change)
         self.cb_enhancer.setToolTip(_("Select a face enhancement model (None = no enhancement)"))
-        grid.addWidget(self.cb_enhancer, len(items) // 2, 1)
+        grid.addWidget(self.cb_enhancer, next_row, 1)
 
         return card
 
@@ -1089,10 +1098,14 @@ class _ProcessingWorker(QThread):
                 elif cached_target_face is not None:
                     cached_faces = [cached_target_face]
 
-                # Fast detection skips the 2d106 landmark model, but the mouth
-                # mask needs it. Attach landmarks on demand (computed once per
-                # detection cycle — the helper no-ops if already present).
-                if modules.globals.mouth_mask and cached_faces:
+                # Fast detection skips the 2d106 landmark model, but mouth
+                # mask and exclude-ears need it. Attach landmarks on demand
+                # (computed once per detection cycle — the helper no-ops if
+                # already present).
+                if (
+                    (modules.globals.mouth_mask or modules.globals.exclude_ears)
+                    and cached_faces
+                ):
                     ensure_landmarks(temp_frame, cached_faces)
 
                 for fp in frame_processors:
