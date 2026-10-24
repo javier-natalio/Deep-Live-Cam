@@ -315,6 +315,7 @@ def save_switch_states():
         "show_mouth_mask_box": modules.globals.show_mouth_mask_box,
         "mouth_mask_size": modules.globals.mouth_mask_size,
         "exclude_ears": modules.globals.exclude_ears,
+        "clear_eyes": modules.globals.clear_eyes,
     }
     try:
         with open("switch_states.json", "w") as f:
@@ -345,6 +346,7 @@ def load_switch_states():
         modules.globals.mouth_mask = False
         modules.globals.show_mouth_mask_box = False
         modules.globals.exclude_ears = state.get("exclude_ears", False)
+        modules.globals.clear_eyes = state.get("clear_eyes", True)
     except FileNotFoundError:
         pass
     except (OSError, json.JSONDecodeError):
@@ -597,6 +599,11 @@ class MainWindow(QMainWindow):
             "Exclude ears",
             "Paste only inside the face outline so ears and headsets stay original",
         )
+        self.sw_clear_eyes = make(
+            "clear_eyes",
+            "Clear Eyes",
+            "Clarify dark iris/pupil edges only — keeps eyes blended with the face",
+        )
         self.sw_color_fix = make("color_correction", "Fix Blueish Cam",
                                  "Fix blue/green color cast from some webcams")
         self.sw_show_fps = make("show_fps", "Show FPS",
@@ -613,7 +620,7 @@ class MainWindow(QMainWindow):
             self.sw_keep_frames, self.sw_many_faces,
             self.sw_map_faces, self.sw_show_fps,
             self.sw_poisson, self.sw_exclude_ears,
-            self.sw_color_fix,
+            self.sw_clear_eyes, self.sw_color_fix,
         ]
         for i, w in enumerate(items):
             grid.addWidget(w, i // 2, i % 2)

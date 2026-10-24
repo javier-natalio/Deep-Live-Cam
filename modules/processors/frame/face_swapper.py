@@ -673,6 +673,10 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
                     swapped_frame, target_face, mouth_mask_data
                 )
         
+    # --- Clear / equalize eyes (sharp pupils, matched left/right) ---
+    if getattr(modules.globals, "clear_eyes", False):
+        swapped_frame = apply_clear_eyes(swapped_frame, target_face)
+
     # --- Poisson Blending ---
     # Mask derived from the swap's own affine (M) + swapped pixels (bgr_fake),
     # so it tracks the swapped face exactly per-frame — no landmark jitter,
@@ -1181,6 +1185,190 @@ def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
 # ==========================
 # MASKING FUNCTIONS (Mostly unchanged, added safety checks and minor improvements)
 # ==========================
+
+def _eye_centers_from_face(face: Face) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Return (left_eye, right_eye) centers in image coords.
+
+    Prefers detector 5-point kps (always present on live faces). Falls back to
+    2d106 eye contours when available.
+    """
+    kps = getattr(face, "kps", None)
+    if kps is not None and isinstance(kps, np.ndarray) and kps.shape[0] >= 2:
+        left = np.asarray(kps[0], dtype=np.float32)
+        right = np.asarray(kps[1], dtype=np.float32)
+        if np.all(np.isfinite(left)) and np.all(np.isfinite(right)):
+            return left, right
+
+    landmarks = getattr(face, "landmark_2d_106", None)
+    if landmarks is None or not isinstance(landmarks, np.ndarray) or landmarks.shape[0] < 96:
+        return None
+    # Repo convention used by face_masking: right eye 33-42, left eye 87-96.
+    right = np.mean(landmarks[33:42], axis=0).astype(np.float32)
+    left = np.mean(landmarks[87:96], axis=0).astype(np.float32)
+    if not (np.all(np.isfinite(left)) and np.all(np.isfinite(right))):
+        return None
+    return left, right
+
+
+def _iris_mask(gray: np.ndarray) -> np.ndarray:
+    """Soft mask of the central dark iris/pupil disk (not sclera or lids)."""
+    h, w = gray.shape[:2]
+    cy, cx = h * 0.5, w * 0.5
+    yy, xx = np.ogrid[:h, :w]
+    dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    # Keep effect inside ~iris radius; fade before sclera/lids.
+    max_r = min(h, w) * 0.28
+    radial = np.clip(1.0 - dist / max(1.0, max_r), 0.0, 1.0).astype(np.float32)
+
+    # Darker-than-median pixels near center ≈ iris/pupil.
+    thresh = float(np.percentile(gray, 38))
+    dark = np.clip((thresh - gray.astype(np.float32)) / max(1.0, thresh), 0.0, 1.0)
+    iris = dark * radial
+    iris = cv2.GaussianBlur(iris, (5, 5), 1.2)
+    peak = float(iris.max())
+    if peak > 1e-3:
+        iris = iris / peak
+    return iris
+
+
+def _enhance_eye_patch(patch: np.ndarray) -> np.ndarray:
+    """Clarify only the black iris/pupil disk; leave sclera and lids alone.
+
+    Whole-eye sharpening / CLAHE made eyes look pasted on. Here we only
+    deepen the dark circular core and gently crisp its boundary ring so the
+    eye stays blended with the rest of the face.
+    """
+    if patch is None or patch.size == 0 or patch.shape[0] < 4 or patch.shape[1] < 4:
+        return patch
+
+    orig = patch.astype(np.float32)
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    iris = _iris_mask(gray)  # [0,1], HxW
+    if float(iris.max()) < 0.05:
+        return patch
+
+    iris_3 = iris[:, :, np.newaxis]
+
+    # Soften interior toward clear black — mild, so it doesn't punch out.
+    deepened = orig * (1.0 - iris_3 * 0.32)
+
+    # Boundary ring of the dark disk (dilate − erode) — crisp limbal edge only.
+    iris_u8 = np.clip(iris * 255.0, 0, 255).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    ring = cv2.dilate(iris_u8, k) - cv2.erode(iris_u8, k)
+    ring = (ring.astype(np.float32) * (1.0 / 255.0))
+    ring = cv2.GaussianBlur(ring, (3, 3), 0.6)
+    ring_peak = float(ring.max())
+    if ring_peak > 1e-3:
+        ring = ring / ring_peak
+    ring_3 = ring[:, :, np.newaxis]
+
+    # Very light unsharp confined to the iris edge ring (not whites/lids).
+    blur = cv2.GaussianBlur(orig, (0, 0), 0.7)
+    sharp = orig * 1.25 + blur * (-0.25)
+
+    out = orig * (1.0 - iris_3) + deepened * iris_3
+    out = out * (1.0 - ring_3 * 0.55) + sharp * (ring_3 * 0.55)
+
+    # Keep original specular catchlights (bright spots) so we don't invent glare.
+    bright = gray.astype(np.float32) > float(np.percentile(gray, 92))
+    out[bright] = orig[bright]
+
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _extract_eye_square(
+    frame: Frame, center: np.ndarray, half: int
+) -> Tuple[Optional[np.ndarray], int, int, int, int]:
+    """Crop a square around an eye center; returns (patch, x1, y1, x2, y2)."""
+    h, w = frame.shape[:2]
+    cx, cy = int(round(float(center[0]))), int(round(float(center[1])))
+    x1, y1 = cx - half, cy - half
+    x2, y2 = cx + half, cy + half
+    if x1 < 0 or y1 < 0 or x2 > w or y2 > h or x2 <= x1 or y2 <= y1:
+        # Clamp to frame; may be slightly off-center near borders.
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None, x1, y1, x2, y2
+    return frame[y1:y2, x1:x2].copy(), x1, y1, x2, y2
+
+
+def apply_clear_eyes(frame: Frame, face: Face) -> Frame:
+    """Post-swap: clarify dark iris/pupil edges without making eyes stick out.
+
+    Edits only the central black disk in each eye. Sclera, lids, and skin keep
+    the swapped-face look so eyes stay flexible with the rest of the face.
+    """
+    if frame is None or face is None:
+        return frame
+
+    centers = _eye_centers_from_face(face)
+    if centers is None:
+        return frame
+    left_c, right_c = centers
+
+    iod = float(np.linalg.norm(left_c - right_c))
+    if not np.isfinite(iod) or iod < 10:
+        return frame
+
+    # Tight crop around each eye — just enough for the iris disk.
+    half = max(5, int(round(iod * 0.22)))
+    # Soft circular paste smaller than the crop so lids/sclera barely change.
+    ax = max(2, int(round(half * 0.55)))
+    ay = max(2, int(round(half * 0.45)))
+
+    left_patch, lx1, ly1, lx2, ly2 = _extract_eye_square(frame, left_c, half)
+    right_patch, rx1, ry1, rx2, ry2 = _extract_eye_square(frame, right_c, half)
+    if left_patch is None or right_patch is None:
+        return frame
+
+    side = half * 2
+    left_r = gpu_resize(left_patch, (side, side), interpolation=cv2.INTER_LINEAR)
+    right_r = gpu_resize(right_patch, (side, side), interpolation=cv2.INTER_LINEAR)
+
+    left_e = _enhance_eye_patch(left_r)
+    right_e = _enhance_eye_patch(right_r)
+
+    # Soft iris-sized paste — no mirror clone (that made eyes look stuck on).
+    mask = np.zeros((side, side), dtype=np.float32)
+    cv2.ellipse(
+        mask,
+        (side // 2, side // 2),
+        (ax, ay),
+        0,
+        0,
+        360,
+        1.0,
+        -1,
+        lineType=cv2.LINE_AA,
+    )
+    # Heavy feather so the edit melts into the surrounding face texture.
+    mask = cv2.GaussianBlur(mask, (9, 9), 3.0)
+    # Cap strength so whites/lids of the original swap still dominate.
+    mask *= 0.75
+    mask_3 = mask[:, :, np.newaxis]
+
+    out = frame.copy()
+
+    def _paste(dst_box, src_patch):
+        x1, y1, x2, y2 = dst_box
+        bw, bh = x2 - x1, y2 - y1
+        if bw <= 0 or bh <= 0:
+            return
+        pasted = src_patch
+        m = mask_3
+        if (bw, bh) != (side, side):
+            pasted = gpu_resize(src_patch, (bw, bh), interpolation=cv2.INTER_LINEAR)
+            m = cv2.resize(mask, (bw, bh), interpolation=cv2.INTER_LINEAR)[:, :, np.newaxis]
+        roi = out[y1:y2, x1:x2].astype(np.float32)
+        blended = pasted.astype(np.float32) * m + roi * (1.0 - m)
+        out[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
+
+    _paste((lx1, ly1, lx2, ly2), left_e)
+    _paste((rx1, ry1, rx2, ry2), right_e)
+    return out
+
 
 def _ellipse_polygon(
     center: np.ndarray,
